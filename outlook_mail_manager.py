@@ -1,26 +1,17 @@
 """
-Mail Manager — Streamlit App
-=====================================
+Outlook Mail Manager — Streamlit App (Windows Native)
+=====================================================
 Single-file Streamlit application to read and send emails
-via IMAP and SMTP using standard Python libraries.
+via local Windows Outlook client using COM and pywin32.
 
-Supports Outlook and Gmail using App Passwords.
+THIS SCRIPT IS DESIGNED EXCLUSIVELY FOR WINDOWS.
 
 Requirements:
-    pip install streamlit pytz
+    pip install streamlit pywin32 pytz
 """
 
-import imaplib
-import smtplib
-import email
-from email.header import decode_header
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 import os
 import time
-import base64
 import math
 import re
 import streamlit as st
@@ -28,13 +19,19 @@ import pytz
 from datetime import datetime, timedelta
 import streamlit.components.v1 as components
 
+try:
+    import win32com.client
+    import pythoncom
+except ImportError:
+    st.error("🚨 `pywin32` library not found or you are not on Windows.\nPlease run `pip install pywin32` on a Windows machine.")
+    win32com = None
+
 # -----------------------------------------------------------------------------
 # [TOP BLOCK] Initialization & Config
 # -----------------------------------------------------------------------------
 
-st.set_page_config(page_title="Mail Manager", page_icon="📬", layout="wide")
+st.set_page_config(page_title="Outlook Manager", page_icon="📬", layout="wide")
 
-# Custom CSS
 st.markdown("""
 <style>
     .block-container { padding-top: 2rem; padding-bottom: 2rem; }
@@ -86,10 +83,6 @@ st.markdown("""
 # -----------------------------------------------------------------------------
 def initialize_session_state():
     session_defaults = {
-        "logged_in": False,
-        "email_address": "",
-        "app_password": "",
-        "provider": "Outlook",
         "emails": [],
         "selected_email_id": None,
         "selected_email_detail": None,
@@ -100,8 +93,7 @@ def initialize_session_state():
         "compose_bcc": "",
         "compose_subject": "",
         "compose_body": "",
-        "folder_list": [],
-        "selected_folder": "INBOX",
+        "selected_folder": "Inbox",
         "total_email_count": 0,
         "last_sync": None
     }
@@ -111,131 +103,216 @@ def initialize_session_state():
 initialize_session_state()
 
 # -----------------------------------------------------------------------------
-# [LOGIN FLOW]
+# [OUTLOOK COM HELPERS]
 # -----------------------------------------------------------------------------
-def get_servers(provider):
-    if provider == "Gmail":
-        return "imap.gmail.com", "smtp.gmail.com"
-    else:
-        return "outlook.office365.com", "smtp.office365.com"
-
-@st.dialog("🔒 Login to Mail Manager")
-def login_dialog():
-    st.write("Bypass standard OAuth by generating a 16-digit **App Password** from your security settings!")
-    
-    provider = st.selectbox("Select Provider", ["Outlook", "Gmail"])
-    email_inp = st.text_input("Email Address")
-    pwd_inp = st.text_input("App Password", type="password")
-    
-    if st.button("Connect Account", type="primary"):
-        with st.spinner("Authenticating..."):
-            imap_host, _ = get_servers(provider)
-            try:
-                mail = imaplib.IMAP4_SSL(imap_host)
-                mail.login(email_inp, pwd_inp)
-                mail.logout()
-                st.session_state.email_address = email_inp
-                st.session_state.app_password = pwd_inp
-                st.session_state.provider = provider
-                st.session_state.logged_in = True
-                st.success("✅ Logged in successfully!")
-                time.sleep(1)
-                st.rerun()
-            except imaplib.IMAP4.error as e:
-                st.error("Login failed. Check your App Password, and ensure IMAP is enabled on your account.")
-
-def get_imap_conn():
-    if not st.session_state.logged_in: return None
-    imap_host, _ = get_servers(st.session_state.provider)
+def get_outlook():
+    if not win32com: return None
     try:
-        mail = imaplib.IMAP4_SSL(imap_host)
-        mail.login(st.session_state.email_address, st.session_state.app_password)
-        return mail
-    except:
-        st.session_state.logged_in = False
+        # Initialize COM in this thread
+        pythoncom.CoInitialize()
+        return win32com.client.Dispatch("Outlook.Application")
+    except Exception as e:
+        st.error(f"Failed to connect to local Outlook client: {e}")
         return None
 
-def get_smtp_conn():
-    if not st.session_state.logged_in: return None
-    _, smtp_host = get_servers(st.session_state.provider)
-    try:
-        server = smtplib.SMTP(smtp_host, 587)
-        server.starttls()
-        server.login(st.session_state.email_address, st.session_state.app_password)
-        return server
-    except:
-        return None
+# Outlook MAPI Folder IDs
+FOLDER_MAP = {
+    "Deleted Items": 3,
+    "Outbox": 4,
+    "Sent Items": 5,
+    "Inbox": 6,
+    "Drafts": 16,
+    "Junk Email": 23
+}
 
-# -----------------------------------------------------------------------------
-# [HELPERS & PARSING]
-# -----------------------------------------------------------------------------
-def decode_mime_str(s):
-    if not s: return ""
-    decoded_string = []
-    try:
-        for part, enc in decode_header(s):
-            if isinstance(part, bytes):
-                decoded_string.append(part.decode(enc or 'utf-8', errors='replace'))
-            else:
-                decoded_string.append(str(part))
-        return "".join(decoded_string)
-    except:
-        return str(s)
-
-def extract_body(msg):
-    body_text = ""
-    body_html = ""
-    attachments = []
-    
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            cdispo = str(part.get('Content-Disposition'))
-            
-            if ctype == 'text/plain' and 'attachment' not in cdispo:
-                try: body_text += part.get_payload(decode=True).decode()
-                except: pass
-            elif ctype == 'text/html' and 'attachment' not in cdispo:
-                try: body_html += part.get_payload(decode=True).decode()
-                except: pass
-            elif 'attachment' in cdispo or part.get_filename():
-                fname = decode_mime_str(part.get_filename())
-                if fname:
-                    attachments.append({
-                        "filename": fname,
-                        "data": part.get_payload(decode=True),
-                        "content_type": ctype
-                    })
-    else:
-        ctype = msg.get_content_type()
+def resolve_folder(namespace, folder_name):
+    # Tries default MAPI standard folders first, fallback to iterating folders
+    if folder_name in FOLDER_MAP:
         try:
-            payload = msg.get_payload(decode=True).decode()
-            if ctype == 'text/plain': body_text = payload
-            elif ctype == 'text/html': body_html = payload
+            return namespace.GetDefaultFolder(FOLDER_MAP[folder_name])
         except:
             pass
-            
-    return body_html if body_html else body_text, "HTML" if body_html else "Text", attachments
+    
+    # Custom folder fallback logic over root folders
+    for f in namespace.Folders:
+        for sub_f in f.Folders:
+            if sub_f.Name.lower() == folder_name.lower():
+                return sub_f
+    return None
 
+def fetch_emails(folder_name="Inbox", search_query="", top=25, skip=0):
+    outlook = get_outlook()
+    if not outlook: return
+    
+    mapi = outlook.GetNamespace("MAPI")
+    folder = resolve_folder(mapi, folder_name)
+    
+    if not folder:
+        st.warning(f"Could not find folder specified: {folder_name}")
+        st.session_state.total_email_count = 0
+        st.session_state.emails = []
+        return
+        
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True) # Sort by date descending
+    
+    if search_query:
+        search_filter = f"@SQL=urn:schemas:httpmail:subject LIKE '%{search_query}%' OR urn:schemas:httpmail:sendername LIKE '%{search_query}%'"
+        try:
+            items = items.Restrict(search_filter)
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+    
+    st.session_state.total_email_count = len(items)
+    parsed_emails = []
+    
+    # Range handling
+    end_idx = min(skip + top, len(items))
+    start_idx = skip
+    
+    current_idx = 0
+    item = items.GetFirst()
+    
+    while item:
+        if current_idx >= end_idx:
+            break
+            
+        if current_idx >= start_idx:
+            # We must ensure it's a MailItem (Class == 43) and not a Calendar Item, etc.
+            if getattr(item, "Class", None) == 43:
+                try:
+                    date_str = str(item.ReceivedTime)
+                except:
+                    date_str = ""
+                    
+                preview = item.Body[:100] if item.Body else ""
+                clean_preview = preview.replace('\r', '').replace('\n', ' ')
+                
+                parsed_emails.append({
+                    "id": item.EntryID,
+                    "subject": item.Subject,
+                    "from": item.SenderName,
+                    "to": item.To,
+                    "date": date_str,
+                    "is_read": not item.UnRead,
+                    "is_flagged": item.IsMarkedAsTask,
+                    "has_attachments": item.Attachments.Count > 0,
+                    "preview": clean_preview,
+                    "body_html": item.HTMLBody,
+                    "body_text": item.Body
+                })
+        
+        item = items.GetNext()
+        current_idx += 1
+
+    st.session_state.emails = parsed_emails
+    st.session_state.last_sync = datetime.now()
+
+def fetch_email_detail(entry_id):
+    outlook = get_outlook()
+    if not outlook: return None
+    mapi = outlook.GetNamespace("MAPI")
+    try:
+        # Fetch directly using EntryID globally
+        msg = mapi.GetItemFromID(entry_id)
+        
+        # Prepare attachments cache (we only list sizes/names because dragging raw COM bytes requires SaveAsFile)
+        attachments = []
+        for att in msg.Attachments:
+            # Type 1 is explicit attachment file
+            if att.Type == 1:
+                attachments.append({
+                    "filename": att.FileName,
+                    "size": getattr(att, "Size", 0),
+                    "index": att.Index
+                })
+                
+        return {
+            "id": msg.EntryID,
+            "subject": msg.Subject,
+            "from": msg.SenderName,
+            "to": msg.To,
+            "date": str(msg.ReceivedTime),
+            "body_html": msg.HTMLBody,
+            "body_text": msg.Body,
+            "attachments_meta": attachments
+        }
+    except Exception as e:
+        st.error(f"Failed to fetch item details: {e}")
+        return None
+
+def mark_as_read(entry_id):
+    outlook = get_outlook()
+    if not outlook: return
+    mapi = outlook.GetNamespace("MAPI")
+    try:
+        msg = mapi.GetItemFromID(entry_id)
+        msg.UnRead = False
+        msg.Save()
+    except:
+        pass
+        
+def send_email(to_str, cc_str, bcc_str, subject, body, format_html, priority, attachments, is_draft=False):
+    outlook = get_outlook()
+    if not outlook: return False
+    
+    try:
+        mail = outlook.CreateItem(0) # 0 = MailItem
+        mail.To = to_str
+        if cc_str: mail.CC = cc_str
+        if bcc_str: mail.BCC = bcc_str
+        mail.Subject = subject
+        
+        if format_html == "HTML":
+            mail.BodyFormat = 2 # olFormatHTML
+            mail.HTMLBody = body
+        else:
+            mail.BodyFormat = 1 # olFormatPlain
+            mail.Body = body
+            
+        if priority == "High":
+            mail.Importance = 2
+        elif priority == "Low":
+            mail.Importance = 0
+        else:
+            mail.Importance = 1
+            
+        # Due to security restrictions in browsers passing files directly into local COM objects,
+        # we have to write the uploaded file temporarily to disk and attach via filepath.
+        if attachments:
+            temp_dir = os.path.join(os.getcwd(), "temp_attachments")
+            os.makedirs(temp_dir, exist_ok=True)
+            for file in attachments:
+                temp_path = os.path.join(temp_dir, file.name)
+                with open(temp_path, "wb") as f:
+                    f.write(file.getvalue())
+                mail.Attachments.Add(temp_path)
+                
+        if is_draft:
+            mail.Save()
+            return True
+        else:
+            mail.Send()
+            return True
+            
+    except Exception as e:
+        st.error(f"Failed to action email: {e}")
+        return False
+
+
+# -----------------------------------------------------------------------------
+# [HELPER FUNCTIONS]
+# -----------------------------------------------------------------------------
 def format_date(date_str):
     if not date_str: return ""
     try:
-        from email.utils import parsedate_to_datetime
-        dt = parsedate_to_datetime(date_str)
-        now = datetime.now(dt.tzinfo)
-        diff = now - dt
-        
-        if diff < timedelta(minutes=5): return "Just now"
-        elif diff < timedelta(hours=24) and now.date() == dt.date(): return dt.strftime("%I:%M %p")
-        elif diff < timedelta(days=2) and now.date() - dt.date() == timedelta(days=1): return "Yesterday"
-        elif diff < timedelta(days=7): return dt.strftime("%a")
-        else: return dt.strftime("%d %b")
+        # Date string formatting cleanup for pywin32 localized dates
+        return date_str[:16] # basic slicing to look clean if tz issues arise
     except:
         return date_str
 
 def get_initials(name):
     if not name: return "?"
-    # Strip email if name comes as "Name <email>"
     name = re.sub(r'<.*?>', '', name).strip()
     parts = name.split()
     if len(parts) >= 2:
@@ -243,142 +320,28 @@ def get_initials(name):
     return name[0:2].upper() if name else "?"
 
 def safe_html(html_str):
-    # Basic script tag removal
-    return re.sub(r'<script.*?>.*?</script>', '', html_str, flags=re.IGNORECASE | re.DOTALL)
-
-# -----------------------------------------------------------------------------
-# [IMAP LOGIC]
-# -----------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
-def get_folders_cached(auth_trigger): 
-    # auth_trigger is passed to bust cache dynamically
-    mail = get_imap_conn()
-    if not mail: return ["INBOX"]
-    status, folders = mail.list()
-    mail.logout()
-    folder_names = []
-    for folder in folders:
-        # Decode IMAP folder list string
-        parts = folder.decode().split(' "/" ')
-        if len(parts) == 2:
-            fname = parts[1].strip('"')
-            if fname not in ["[Gmail]", "INBOX"]: # Clean up some defaults
-                folder_names.append(fname)
-    return ["INBOX"] + sorted(folder_names)
-
-def fetch_emails(folder="INBOX", search_query="", top=25, skip=0):
-    mail = get_imap_conn()
-    if not mail: return
-    
-    # Try selecting folder
-    status, data = mail.select(f'"{folder}"', readonly=True)
-    if status != "OK":
-        st.error(f"Could not open folder {folder}")
-        mail.logout()
-        return
-
-    # Handle Search
-    if search_query:
-        # Simple subject/from search
-        status, messages = mail.search(None, f'(OR SUBJECT "{search_query}" FROM "{search_query}")')
-    else:
-        status, messages = mail.search(None, 'ALL')
-
-    mail_ids = messages[0].split()
-    st.session_state.total_email_count = len(mail_ids)
-    
-    if not mail_ids:
-        st.session_state.emails = []
-        mail.logout()
-        return
-        
-    mail_ids.reverse() # Newest first
-    target_ids = mail_ids[skip:skip+top]
-    
-    results = []
-    
-    # Fetch in bulk if possible, or iterate
-    # Using iteration since target_ids is small (top=25 max usually)
-    for m_id in target_ids:
-        # Fetch FLAGS and BODY.PEEK to keep them unread until explicitly opened
-        res, msg_data = mail.fetch(m_id, '(FLAGS BODY.PEEK[])')
-        
-        flags = []
-        raw_email = b""
-        
-        for response_part in msg_data:
-            if isinstance(response_part, tuple):
-                # response_part[0] contains the flags and headers
-                # response_part[1] contains the actual body bytes
-                parse_head = response_part[0].decode(errors='ignore')
-                raw_email = response_part[1]
-                
-                # Extract flags
-                flag_match = re.search(r'FLAGS \((.*?)\)', parse_head)
-                if flag_match:
-                    flags = flag_match.group(1).split()
-        
-        if raw_email:
-            msg = email.message_from_bytes(raw_email)
-            subject = decode_mime_str(msg.get("Subject"))
-            sender = decode_mime_str(msg.get("From"))
-            date_str = msg.get("Date")
-            
-            body_content, content_type, attachments = extract_body(msg)
-            
-            clean_text_preview = re.sub('<[^<]+?>', '', body_content) if content_type == "HTML" else body_content
-            clean_text_preview = clean_text_preview.replace('\r', '').replace('\n', ' ')
-            
-            results.append({
-                "id": m_id.decode(),
-                "subject": subject,
-                "from": sender,
-                "to": decode_mime_str(msg.get("To")),
-                "date": date_str,
-                "is_read": '\\Seen' in flags,
-                "is_flagged": '\\Flagged' in flags,
-                "has_attachments": len(attachments) > 0,
-                "preview": clean_text_preview[:100],
-                "body": body_content,
-                "body_type": content_type,
-                "attachments": attachments
-            })
-
-    mail.logout()
-    st.session_state.emails = results
-    st.session_state.last_sync = datetime.now()
-
-def mark_as_read(uid):
-    mail = get_imap_conn()
-    if not mail: return
-    mail.select(f'"{st.session_state.selected_folder}"')
-    mail.store(uid, '+FLAGS', '\\Seen')
-    mail.logout()
+    return re.sub(r'<script.*?>.*?</script>', '', str(html_str), flags=re.IGNORECASE | re.DOTALL)
 
 # -----------------------------------------------------------------------------
 # [UI BLOCKS]
 # -----------------------------------------------------------------------------
 def sidebar():
     with st.sidebar:
-        st.title("📬 Mail Manager")
+        st.title("📬 Windows Outlook Manager")
         st.markdown("---")
         
-        if not st.session_state.logged_in:
-            st.warning("Not Connected")
-            if st.button("Log In (App Password)", use_container_width=True):
-                login_dialog()
+        if not win32com:
+            st.error("COM Failed - Run on Windows")
             return
             
-        st.success("✅ Connected")
-        st.write(f"**Account:** {st.session_state.email_address}")
-        st.write(f"**Provider:** {st.session_state.provider}")
+        st.success("✅ COM Connected to Outlook Desktop")
+        
+        outlook = get_outlook()
+        current_acc = outlook.Session.CurrentUser.AddressEntry.GetExchangeUser().PrimarySmtpAddress if hasattr(outlook.Session.CurrentUser, "AddressEntry") and outlook.Session.CurrentUser.AddressEntry.GetExchangeUser() else outlook.Session.CurrentUser.Name
+        st.write(f"**Account:** {current_acc}")
         
         st.markdown("---")
-        if st.button("🗑️ Log Out", use_container_width=True):
-            for k in list(st.session_state.keys()): del st.session_state[k]
-            st.rerun()
-            
-        if st.button("🔄 Clear App Cache", use_container_width=True):
+        if st.button("🔄 Clear Viewer Cache", use_container_width=True):
             st.session_state.emails = []
             st.session_state.selected_email_id = None
             st.rerun()
@@ -392,8 +355,8 @@ def sidebar():
             st.slider("Max emails to load", 10, 100, 25, key="cfg_max_emails")
             
 def tab_read_mails():
-    if not st.session_state.logged_in:
-        st.info("👋 Welcome! Use the sidebar to sign in using your App Password.")
+    if not win32com:
+        st.info("👋 This script requires Windows with Outlook installed natively.")
         return
 
     emails = st.session_state.emails
@@ -402,22 +365,22 @@ def tab_read_mails():
 
     m1, m2, m3 = st.columns(3)
     m1.markdown(f'<div class="metric-card"><div class="metric-title">Unread (Loaded)</div><div class="metric-value">{unread_count}</div></div>', unsafe_allow_html=True)
-    m2.markdown(f'<div class="metric-card"><div class="metric-title">Pagination Size</div><div class="metric-value">{len(emails)}</div></div>', unsafe_allow_html=True)
+    m2.markdown(f'<div class="metric-card"><div class="metric-title">Loaded Size</div><div class="metric-value">{len(emails)}</div></div>', unsafe_allow_html=True)
     m3.markdown(f'<div class="metric-card"><div class="metric-title">Total in Folder</div><div class="metric-value">{total_count}</div></div>', unsafe_allow_html=True)
     st.write("")
 
     # Controls
-    folder_list = get_folders_cached(st.session_state.email_address)
+    folder_list = list(FOLDER_MAP.keys())
     
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        selected_folder = st.selectbox("Folder", folder_list, index=folder_list.index(st.session_state.selected_folder) if st.session_state.selected_folder in folder_list else 0)
+        selected_folder = st.selectbox("Folder", folder_list, index=folder_list.index(st.session_state.selected_folder) if st.session_state.selected_folder in folder_list else 3)
         st.session_state.selected_folder = selected_folder
-    with c4:
+    with c2:
         st.write("")
         st.write("")
         if st.button("Fetch / Refresh", use_container_width=True):
-            with st.spinner("Fetching emails..."):
+            with st.spinner("Talking to Outlook..."):
                 fetch_emails(selected_folder, st.session_state.search_query, top=st.session_state.get("cfg_max_emails", 25))
                 st.session_state.current_page = 0
                 st.session_state.selected_email_id = None
@@ -469,12 +432,26 @@ def tab_read_mails():
             st.markdown(f'<div style="text-align:right; font-size:12px; color:#999; margin-bottom: 5px;">{format_date(e["date"])}</div>', unsafe_allow_html=True)
             if st.button("Read", key=f"read_{e['id']}", use_container_width=True):
                 st.session_state.selected_email_id = e['id']
-                st.session_state.selected_email_detail = e
+                with st.spinner("Fetching full item data via COM..."):
+                    st.session_state.selected_email_detail = fetch_email_detail(e['id'])
                 if not e.get("is_read"):
                     mark_as_read(e['id'])
                     e["is_read"] = True
         
         st.markdown(f'<div style="border-bottom: 1px solid #eee; margin-top: 10px;"></div>', unsafe_allow_html=True)
+
+    # Pagination controls
+    pc1, pc2, pc3 = st.columns([2, 6, 2])
+    with pc1:
+        if st.button("⬅️ Previous", disabled=(st.session_state.current_page == 0)):
+            st.session_state.current_page -= 1
+            st.rerun()
+    with pc2:
+        st.write(f"<div style='text-align:center;'>Page {st.session_state.current_page + 1} of {max(1, total_pages)}</div>", unsafe_allow_html=True)
+    with pc3:
+        if st.button("Next ➡️", disabled=(st.session_state.current_page >= total_pages - 1)):
+            st.session_state.current_page += 1
+            st.rerun()
 
     # Detail View
     if st.session_state.selected_email_id and st.session_state.selected_email_detail:
@@ -484,6 +461,7 @@ def tab_read_mails():
         with st.container(border=True):
             st.subheader(detail.get("subject", "(No Subject)"))
             st.markdown(f"**From:** {detail.get('from')}")
+            st.markdown(f"**To:** {detail.get('to')}")
             st.markdown(f"**Date:** {format_date(detail.get('date'))}")
             
             bc1, bc2, bc3, bc4 = st.columns([1,1,1,5])
@@ -494,33 +472,28 @@ def tab_read_mails():
                     st.rerun()
             with bc2:
                 if st.button("↩️ Reply"):
-                    # Basic extraction of email address for reply
-                    from_email = re.search(r'<([^>]+)>', detail.get('from', ''))
-                    st.session_state.compose_to = from_email.group(1) if from_email else detail.get('from')
+                    st.session_state.compose_to = detail.get('from', '')
                     st.session_state.compose_subject = f"Re: {detail.get('subject')}"
                     st.session_state.compose_body = f"\n\n---Original Message---\nFrom: {detail.get('from')}\n\n"
                     st.session_state.active_tab = "Send Mail"
                     st.rerun()
             
             st.markdown("---")
-            if detail.get("body_type") == "HTML":
-                components.html(safe_html(detail["body"]), height=400, scrolling=True)
-            else:
-                st.text_area("Content", detail["body"], height=400, disabled=True)
             
-            if detail.get("has_attachments"):
-                st.markdown("#### Attachments")
-                for att in detail["attachments"]:
-                    st.download_button(
-                        label=f"⬇️ {att['filename']} ({len(att['data']) // 1024} KB)",
-                        data=att['data'],
-                        file_name=att['filename'],
-                        mime=att['content_type']
-                    )
+            if detail.get("body_html"):
+                components.html(safe_html(detail["body_html"]), height=400, scrolling=True)
+            else:
+                st.text_area("Content", detail.get("body_text", ""), height=400, disabled=True)
+            
+            if detail.get("attachments_meta"):
+                st.markdown("#### Attachments Meta Details")
+                st.info("File download blocks stream directly via COM. Review files in Outlook Desktop Directly to securely save items.")
+                for att in detail["attachments_meta"]:
+                    st.write(f"- 📎 {att['filename']} ({att['size'] // 1024} KB)")
 
 def tab_send_mail():
-    if not st.session_state.logged_in:
-        st.warning("Please login first.")
+    if not win32com:
+        st.warning("Please run on Windows.")
         return
         
     st.header("Compose Email")
@@ -533,44 +506,31 @@ def tab_send_mail():
         body_format = st.radio("Format", ["Plain Text", "HTML"], index=0, horizontal=True)
         body_input = st.text_area("Body", value=st.session_state.get("compose_body", ""), height=250)
         
+        priority = st.selectbox("Priority", ["Normal", "High", "Low"], index=0)
+        
         attachments = st.file_uploader("Attachments", accept_multiple_files=True)
         
-        b1, b2 = st.columns([2, 8])
-        if b1.form_submit_button("📤 Send Email", type="primary"):
+        b1, b2, b3 = st.columns([2, 2, 8])
+        if b1.form_submit_button("📤 Send Email natively", type="primary"):
             if not to_input or not subject_input or not body_input:
                 st.error("To, Subject, and Body are required.")
             else:
-                with st.spinner("Sending via SMTP..."):
-                    server = get_smtp_conn()
-                    if server:
-                        msg = MIMEMultipart()
-                        msg['From'] = st.session_state.email_address
-                        msg['To'] = to_input
-                        msg['Cc'] = cc_input
-                        msg['Subject'] = subject_input
-                        
-                        msg.attach(MIMEText(body_input, 'html' if body_format == "HTML" else 'plain'))
-                        
-                        for file in attachments:
-                            part = MIMEBase('application', 'octet-stream')
-                            part.set_payload(file.getvalue())
-                            encoders.encode_base64(part)
-                            part.add_header('Content-Disposition', f'attachment; filename="{file.name}"')
-                            msg.attach(part)
-                        
-                        all_recipients = [e.strip() for e in to_input.split(",")] + [e.strip() for e in cc_input.split(",") if e.strip()]
-                        
-                        try:
-                            server.sendmail(st.session_state.email_address, all_recipients, msg.as_string())
-                            server.quit()
-                            st.success(f"✅ Email sent successfully to {to_input}!")
-                            st.session_state.compose_to = ""
-                            st.session_state.compose_subject = ""
-                            st.session_state.compose_body = ""
-                        except Exception as e:
-                            st.error(f"Failed to send: {e}")
-                    else:
-                        st.error("SMTP Connection failed.")
+                with st.spinner("Dispatching via Outlook COM..."):
+                    success = send_email(to_input, cc_input, "", subject_input, body_input, body_format, priority, attachments, is_draft=False)
+                    if success:
+                        st.success(f"✅ Email passed to desktop Outlook outbox successfully!")
+                        st.session_state.compose_to = ""
+                        st.session_state.compose_subject = ""
+                        st.session_state.compose_body = ""
+        
+        if b2.form_submit_button("💾 Save as Draft natively"):
+            if not subject_input:
+                st.error("Subject is required.")
+            else:
+                with st.spinner("Filing away Draft via COM..."):
+                    success = send_email(to_input, cc_input, "", subject_input, body_input, body_format, priority, attachments, is_draft=True)
+                    if success:
+                        st.success("Draft securely saved directly in your Desktop Outlook application!")
 
 # -----------------------------------------------------------------------------
 def main():
