@@ -337,7 +337,10 @@ def sidebar():
         st.success("✅ COM Connected to Outlook Desktop")
         
         outlook = get_outlook()
-        current_acc = outlook.Session.CurrentUser.AddressEntry.GetExchangeUser().PrimarySmtpAddress if hasattr(outlook.Session.CurrentUser, "AddressEntry") and outlook.Session.CurrentUser.AddressEntry.GetExchangeUser() else outlook.Session.CurrentUser.Name
+        try:
+            current_acc = outlook.Session.Accounts.Item(1).SmtpAddress
+        except Exception:
+            current_acc = "Active Local Session"
         st.write(f"**Account:** {current_acc}")
         
         st.markdown("---")
